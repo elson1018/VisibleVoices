@@ -1,0 +1,12 @@
+# Ignore the Kaggle Dataset
+msl_dataset/
+
+# Ignore PyTorch Model Weights
+*.pth
+
+# Ignore Python Virtual Environments
+backend/pt-venv/
+backend/__pycache__/
+
+# Ignore React Dependencies
+frontend/node_modules/git
