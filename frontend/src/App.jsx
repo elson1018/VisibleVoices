@@ -1,155 +1,188 @@
-import { useState, useEffect, useRef } from 'react'
-import { HandLandmarker, FilesetResolver } from '@mediapipe/tasks-vision'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import './App.css'
 
+const CAPTURE_MS = 1500
+
+// Guide box: centered square, 65% of the shorter dimension
+const getBox = (w, h) => {
+  const s = Math.min(w, h) * 0.65
+  return { x: (w - s) / 2, y: (h - s) / 2, s }
+}
+
 function App() {
-  const [image, setImage] = useState(null)
-  const [preview, setPreview] = useState(null)
-  const [prediction, setPrediction] = useState('')
-  const [loading, setLoading] = useState(false)
-  const [landmarker, setLandmarker] = useState(null)
+  const [status,     setStatus]     = useState('idle')
+  const [prediction, setPrediction] = useState(null)
+  const [confidence, setConfidence] = useState(null)
+  const [isScanning, setIsScanning] = useState(false)
 
-  // References to interact with the raw DOM elements
-  const imageRef = useRef(null)
-  const canvasRef = useRef(null)
+  const videoRef   = useRef(null)
+  const canvasRef  = useRef(null)
+  const rafRef     = useRef(null)
+  const streamRef  = useRef(null)
+  const timerRef   = useRef(null)
+  const sendingRef = useRef(false)
 
-  // --- 1. INITIALIZE MEDIAPIPE ON LOAD ---
-  useEffect(() => {
-    const initializeMediaPipe = async () => {
-      // Load the WebAssembly core from Google's CDN
-      const vision = await FilesetResolver.forVisionTasks(
-        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
-      )
-      // Load the specific Hand Tracking model
-      const handLandmarker = await HandLandmarker.createFromOptions(vision, {
-        baseOptions: {
-          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
-          delegate: "GPU" // Use the user's local GPU for tracking
-        },
-        runningMode: "IMAGE",
-        numHands: 1
-      })
-      setLandmarker(handLandmarker)
-    }
-    initializeMediaPipe()
-  }, [])
-
-  const handleImageChange = (e) => {
-    const file = e.target.files[0]
-    if (file) {
-      setImage(file)
-      setPreview(URL.createObjectURL(file))
-      setPrediction('')
-    }
-  }
-
-  // --- 2. THE PROCESSING PIPELINE ---
-  const handleSubmit = async (e) => {
-    e.preventDefault()
-    if (!image || !landmarker || !imageRef.current || !canvasRef.current) return
-
-    setLoading(true)
-
-    // A. Scan the image for hands
-    const result = landmarker.detect(imageRef.current)
-
-    if (result.handLandmarks.length === 0) {
-      setPrediction("Error: No hand detected in the image.")
-      setLoading(false)
+  // --- Draw loop: mirror video + animated guide box ---
+  const drawLoop = useCallback(() => {
+    const video  = videoRef.current
+    const canvas = canvasRef.current
+    if (!video || !canvas || video.readyState < 2 || !video.videoWidth) {
+      rafRef.current = requestAnimationFrame(drawLoop)
       return
     }
-
-    // B. Calculate Bounding Box
-    const landmarks = result.handLandmarks[0]
-    const imgWidth = imageRef.current.naturalWidth
-    const imgHeight = imageRef.current.naturalHeight
-
-    // Find the extreme edges of the hand
-    let minX = Math.min(...landmarks.map(l => l.x)) * imgWidth
-    let maxX = Math.max(...landmarks.map(l => l.x)) * imgWidth
-    let minY = Math.min(...landmarks.map(l => l.y)) * imgHeight
-    let maxY = Math.max(...landmarks.map(l => l.y)) * imgHeight
-
-    // Add 40 pixels of padding so we don't cut off fingertips
-    const padding = 40
-    minX = Math.max(0, minX - padding)
-    minY = Math.max(0, minY - padding)
-    maxX = Math.min(imgWidth, maxX + padding)
-    maxY = Math.min(imgHeight, maxY + padding)
-
-    const cropWidth = maxX - minX
-    const cropHeight = maxY - minY
-
-    // C. Crop the Image using Canvas
-    const canvas = canvasRef.current
-    canvas.width = cropWidth
-    canvas.height = cropHeight
+    const W = video.videoWidth, H = video.videoHeight
+    canvas.width = W; canvas.height = H
     const ctx = canvas.getContext('2d')
-    
-    ctx.drawImage(
-      imageRef.current,
-      minX, minY, cropWidth, cropHeight, // Source coordinates (the crop)
-      0, 0, cropWidth, cropHeight        // Destination coordinates (the canvas)
-    )
 
-    // D. Send the Cropped Data to PyTorch
-    canvas.toBlob(async (blob) => {
-      const formData = new FormData()
-      // Package the blob exactly like a normal file upload
-      formData.append('file', blob, 'cropped_hand.jpg') 
+    // Mirror draw
+    ctx.save()
+    ctx.scale(-1, 1)
+    ctx.translate(-W, 0)
+    ctx.drawImage(video, 0, 0)
+    ctx.restore()
 
-      try {
-        const response = await fetch('http://127.0.0.1:5001/predict', {
-          method: 'POST',
-          body: formData,
-        })
-        const data = await response.json()
-        
-        if (data.status === 'success') {
-          setPrediction(data.prediction)
-        } else {
-          setPrediction('Error: ' + data.error)
-        }
-      } catch (error) {
-        console.error('Error connecting to AI:', error)
-        setPrediction('Failed to connect to backend.')
-      } finally {
-        setLoading(false)
+    // Dim outside box
+    const { x, y, s } = getBox(W, H)
+    ctx.fillStyle = 'rgba(0,0,0,0.45)'
+    ctx.fillRect(0, 0, W, y)
+    ctx.fillRect(0, y + s, W, H - y - s)
+    ctx.fillRect(0, y, x, s)
+    ctx.fillRect(x + s, y, W - x - s, s)
+
+    // Pulsing border
+    const alpha = 0.55 + 0.45 * Math.sin(Date.now() / 450)
+    ctx.strokeStyle = `rgba(192,132,252,${alpha})`
+    ctx.lineWidth = 2
+    ctx.strokeRect(x, y, s, s)
+
+    // Corner accents
+    const cl = 22
+    ctx.strokeStyle = '#c084fc'
+    ctx.lineWidth = 4
+    ctx.lineCap = 'round'
+    const drawCorner = (cx, cy, sx, sy) => {
+      ctx.beginPath(); ctx.moveTo(cx + sx * cl, cy); ctx.lineTo(cx, cy); ctx.lineTo(cx, cy + sy * cl); ctx.stroke()
+    }
+    drawCorner(x,     y,     1,  1)
+    drawCorner(x + s, y,    -1,  1)
+    drawCorner(x,     y + s, 1, -1)
+    drawCorner(x + s, y + s,-1, -1)
+
+    rafRef.current = requestAnimationFrame(drawLoop)
+  }, [])
+
+  // --- Capture guide box region → Flask ---
+  const captureAndPredict = useCallback(async () => {
+    if (sendingRef.current) return
+    const video = videoRef.current
+    if (!video || video.readyState < 2 || !video.videoWidth) return
+
+    sendingRef.current = true
+    setIsScanning(true)
+    try {
+      const { x, y, s } = getBox(video.videoWidth, video.videoHeight)
+      const crop = document.createElement('canvas')
+      crop.width = s; crop.height = s
+      // Draw non-mirrored video crop (matches training data orientation)
+      crop.getContext('2d').drawImage(video, x, y, s, s, 0, 0, s, s)
+
+      const blob = await new Promise(r => crop.toBlob(r, 'image/jpeg', 0.9))
+      if (!blob) return
+
+      const fd = new FormData()
+      fd.append('file', blob, 'frame.jpg')
+      const API_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:5001'
+      const res  = await fetch(`${API_URL}/predict`, { method: 'POST', body: fd })
+      const data = await res.json()
+      if (data.status === 'success') {
+        setPrediction(data.prediction)
+        setConfidence(data.confidence)
       }
-    }, 'image/jpeg')
+    } catch (err) {
+      console.error('Predict error:', err)
+    } finally {
+      sendingRef.current = false
+      setIsScanning(false)
+    }
+  }, [])
+
+  // --- Start camera ---
+  const startCamera = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' }
+      })
+      streamRef.current = stream
+      videoRef.current.srcObject = stream
+      await new Promise(r => { videoRef.current.onloadedmetadata = r })
+      await videoRef.current.play()
+      setStatus('running')
+      rafRef.current = requestAnimationFrame(drawLoop)
+      timerRef.current = setInterval(captureAndPredict, CAPTURE_MS)
+    } catch (err) {
+      console.error('Camera error:', err)
+      setStatus('error')
+    }
   }
+
+  // --- Stop camera ---
+  const stopCamera = () => {
+    cancelAnimationFrame(rafRef.current)
+    clearInterval(timerRef.current)
+    streamRef.current?.getTracks().forEach(t => t.stop())
+    streamRef.current = null
+    setStatus('idle')
+    setPrediction(null)
+    setConfidence(null)
+    setIsScanning(false)
+  }
+
+  useEffect(() => () => { stopCamera() }, [])
 
   return (
     <div className="app-container">
       <h1>MSL Translator</h1>
-      <p>{landmarker ? "AI System Ready. Upload an image." : "Loading AI Models..."}</p>
-      
-      <form onSubmit={handleSubmit} className="upload-form">
-        <input type="file" accept="image/*" onChange={handleImageChange} />
-        <button type="submit" disabled={!image || loading || !landmarker}>
-          {loading ? 'Processing...' : 'Translate Sign'}
-        </button>
-      </form>
-      
-      {/* Hidden canvas used purely for math and cropping */}
-      <canvas ref={canvasRef} style={{ display: 'none' }} />
 
-      {preview && (
-        <div className="preview-section" style={{ marginTop: '20px' }}>
-          {/* We must render the image so MediaPipe can read its pixels */}
-          <img 
-            ref={imageRef}
-            src={preview} 
-            alt="Uploaded sign" 
-            style={{ maxWidth: '300px', borderRadius: '8px' }} 
-            crossOrigin="anonymous"
-          />
+      <p className={`status-badge ${status === 'running' ? 'active' : ''}`}>
+        {status === 'idle'    && '👋 Ready — click Start Camera'}
+        {status === 'running' && (isScanning ? '🔍 Analysing…' : '🎥 Place your hand in the box')}
+        {status === 'error'   && '❌ Camera access failed'}
+      </p>
+
+      <div className={`camera-wrapper ${status === 'running' ? 'live' : ''}`}>
+        {/* Video kept rendered (not display:none) so browser maintains frame pipeline */}
+        <video ref={videoRef} autoPlay playsInline muted
+          style={{ position:'absolute', inset:0, width:'100%', height:'100%', opacity:0, pointerEvents:'none' }}
+        />
+        <canvas ref={canvasRef} className={`camera-canvas ${status !== 'running' ? 'hidden' : ''}`} />
+        {status !== 'running' && (
+          <div className="camera-placeholder">
+            <div className="placeholder-icon">🤟</div>
+            <p>Camera feed will appear here</p>
+          </div>
+        )}
+      </div>
+
+      <div className="controls">
+        {status !== 'running'
+          ? <button className="btn-primary" onClick={startCamera} disabled={status === 'error'}>Start Camera</button>
+          : <button className="btn-stop"    onClick={stopCamera}>Stop Camera</button>
+        }
+      </div>
+
+      {prediction !== null ? (
+        <div className={`result-section ${isScanning ? 'dimmed' : ''}`}>
+          <div className="letter-display">{prediction}</div>
+          {confidence !== null && (
+            <p className="confidence">
+              Confidence: <strong>{confidence}%</strong>
+              {isScanning && <span className="scan-indicator"> · Scanning…</span>}
+            </p>
+          )}
         </div>
-      )}
-      
-      {prediction && (
-        <div className="result-section" style={{ marginTop: '20px' }}>
-          <h2>Detected Letter: <span style={{ color: '#4CAF50' }}>{prediction}</span></h2>
+      ) : status === 'running' && (
+        <div className="result-section empty">
+          <p>Hold your sign still inside the box…</p>
         </div>
       )}
     </div>
