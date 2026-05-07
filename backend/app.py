@@ -2,6 +2,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.models as models
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from torchvision import transforms
@@ -14,33 +15,25 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 app = Flask(__name__)
 CORS(app) # Allows your React frontend to talk to this API
 
-# --- 1. RECREATE THE MODEL ARCHITECTURE ---
-# PyTorch needs to know the "shape" of the model to load the weights into
-class SignLanguageCNN(nn.Module):
-    def __init__(self, num_classes):
-        super().__init__()
-        self.conv_layers = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, padding=1), nn.BatchNorm2d(16), nn.ReLU(), nn.MaxPool2d(2, 2),
-            nn.Conv2d(16, 32, kernel_size=3, padding=1), nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2, 2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2, 2),
-        )
-        self.fc_layers = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(64 * 16 * 16, 256),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(256, num_classes)
-        )
-
-    def forward(self, x):
-        return self.fc_layers(self.conv_layers(x))
+# --- 1. RECREATE THE MODEL ARCHITECTURE (MobileNetV2 + MSL classifier head) ---
+# Must match msl_train.py exactly so saved weights load correctly.
+def build_model(num_classes):
+    m = models.mobilenet_v2(weights=None)  # No pretrained weights — we load our own
+    m.classifier = nn.Sequential(
+        nn.Dropout(0.3),
+        nn.Linear(m.last_channel, 256),
+        nn.ReLU(),
+        nn.Dropout(0.2),
+        nn.Linear(256, num_classes)
+    )
+    return m
 
 # --- 2. LOAD THE TRAINED WEIGHTS ---
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Loading model on: {device}")
 
 # 26 classes for A-Z
-model = SignLanguageCNN(num_classes=26) 
+model = build_model(num_classes=26) 
 model_path = os.path.join(BASE_DIR, 'msl_alphabet_model.pth')
 model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
 model.to(device)
@@ -58,10 +51,11 @@ print("Model warmed up and ready.")
 class_names = [chr(i) for i in range(65, 91)] 
 
 # Define how incoming images should be processed (must match training!)
+# MobileNetV2 was pretrained on 224x224 with ImageNet normalisation
 transform = transforms.Compose([
-    transforms.Resize((128, 128)),
+    transforms.Resize((224, 224)),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]) 
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
 # --- 3. CREATE THE API ENDPOINT ---
